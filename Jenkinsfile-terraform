@@ -1,0 +1,223 @@
+///////////////////////////////////////////////////////////////
+// Jenkinsfile-terraform
+// Pipeline CI/CD complet : SonarQube → Docker → Terraform → K8s
+// Choisir le scénario et l'action Terraform au lancement
+///////////////////////////////////////////////////////////////
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'TERRAFORM_SCENARIO',
+            choices: ['scenario1-free-tier'],
+            description: 'Scénario Terraform à exécuter'
+        )
+        choice(
+            name: 'TERRAFORM_ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Action Terraform : plan (dry-run) | apply (déployer) | destroy (détruire)'
+        )
+        booleanParam(
+            name: 'SKIP_BUILD',
+            defaultValue: false,
+            description: 'Passer les étapes build/push Docker (si déjà buildé)'
+        )
+        // DEPLOY_K8S_MANIFESTS removed — EKS scenario ignored
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Tag des images Docker à déployer'
+        )
+    }
+
+    environment {
+        DOCKERHUB_NAMESPACE      = 'anoor9s6'
+        BACKEND_IMAGE            = "${DOCKERHUB_NAMESPACE}/portfolio-backend:${params.IMAGE_TAG}"
+        FRONTEND_IMAGE           = "${DOCKERHUB_NAMESPACE}/portfolio-frontend:${params.IMAGE_TAG}"
+        DOCKERHUB_CREDENTIAL_ID  = 'dockerhub-creds'
+        AWS_CREDENTIAL_ID        = 'aws-credentials'    // Credential Jenkins type AWS
+        TF_DIR                   = "terraform/${params.TERRAFORM_SCENARIO}"
+        TF_VAR_FILE              = "terraform.tfvars"
+        SONAR_SERVER             = 'sonarqube-server'
+    }
+
+    stages {
+
+        // ── 1. Checkout ──────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    echo "Commit : ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        // ── 2. SonarQube ─────────────────────────────────────
+        stage('SonarQube Analysis') {
+            when { not { expression { params.SKIP_BUILD } } }
+            steps {
+                withSonarQubeEnv('sonarqube-server') {
+                    withEnv(["SONAR_HOST_URL=http://sonarqube:9000"]) {
+                        sh '/var/jenkins_home/tools/hudson.plugins.sonar.SonarRunnerInstallation/sonar-scanner/bin/sonar-scanner -Dsonar.host.url=http://sonarqube:9000'
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            when { not { expression { params.SKIP_BUILD } } }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ── 3. Build & Push Docker ───────────────────────────
+        stage('Build Docker Images') {
+            when { not { expression { params.SKIP_BUILD } } }
+            parallel {
+                stage('Build Backend') {
+                    steps {
+                        sh "docker build -t ${BACKEND_IMAGE} ./backend"
+                    }
+                }
+                stage('Build Frontend') {
+                    steps {
+                        sh "docker build -t ${FRONTEND_IMAGE} ."
+                    }
+                }
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            when { not { expression { params.SKIP_BUILD } } }
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: "${DOCKERHUB_CREDENTIAL_ID}",
+                    usernameVariable: 'DOCKERHUB_USER',
+                    passwordVariable: 'DOCKERHUB_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin
+                        docker push $BACKEND_IMAGE
+                        docker push $FRONTEND_IMAGE
+                    '''
+                }
+            }
+        }
+
+        // ── 4. Terraform ─────────────────────────────────────
+        stage('Terraform Init') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDENTIAL_ID}",
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir("${TF_DIR}") {
+                        sh '''
+                            terraform init -input=false
+                            terraform validate
+                            echo "✅ Terraform init + validate OK"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDENTIAL_ID}",
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir("${TF_DIR}") {
+                        sh '''
+                            terraform plan \
+                              -var-file="${TF_VAR_FILE}" \
+                              -var="backend_image_tag=${IMAGE_TAG}" \
+                              -var="frontend_image_tag=${IMAGE_TAG}" \
+                              -out=tfplan \
+                              -input=false
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply / Destroy') {
+            when {
+                expression { params.TERRAFORM_ACTION in ['apply', 'destroy'] }
+            }
+            steps {
+                // Confirmation manuelle pour apply et destroy
+                input message: "⚠️ Confirmer l'action Terraform : ${params.TERRAFORM_ACTION} sur ${params.TERRAFORM_SCENARIO} ?", ok: "Confirmer"
+
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: "${AWS_CREDENTIAL_ID}",
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    dir("${TF_DIR}") {
+                        script {
+                            if (params.TERRAFORM_ACTION == 'apply') {
+                                sh 'terraform apply -input=false -auto-approve tfplan'
+                                // Sauvegarder les outputs dans un fichier
+                                sh 'terraform output -json > /tmp/terraform_outputs.json'
+                            } else if (params.TERRAFORM_ACTION == 'destroy') {
+                                sh '''
+                                    terraform destroy \
+                                      -var-file="${TF_VAR_FILE}" \
+                                      -input=false \
+                                      -auto-approve
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 5. Déploiement K8s (Scénario 2 uniquement) ───────
+        // EKS deployment stages removed: scenario2-eks is ignored per request
+    }
+
+    post {
+        success {
+            mail to: 'kernelshell7@gmail.com',
+                subject: "✅ Pipeline Terraform réussi - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    Pipeline Terraform exécuté avec succès !
+
+                    Scénario : ${params.TERRAFORM_SCENARIO}
+                    Action   : ${params.TERRAFORM_ACTION}
+                    Build    : #${env.BUILD_NUMBER}
+                    Commit   : ${env.GIT_COMMIT_SHORT}
+                    URL      : ${env.BUILD_URL}
+                                    """
+                            }
+                            failure {
+                                mail to: 'kernelshell7@gmail.com',
+                                    subject: "❌ Pipeline Terraform échoué - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                                    body: """
+                    Pipeline Terraform échoué !
+
+                    Scénario : ${params.TERRAFORM_SCENARIO}
+                    Action   : ${params.TERRAFORM_ACTION}
+                    Build    : #${env.BUILD_NUMBER}
+                    Logs     : ${env.BUILD_URL}console
+                """
+        }
+        always {
+            cleanWs()
+        }
+    }
+}

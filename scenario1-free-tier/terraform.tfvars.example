@@ -1,0 +1,29 @@
+###############################################################
+# terraform.tfvars.example
+# Copier ce fichier en terraform.tfvars et remplir les valeurs
+# NE PAS committer terraform.tfvars (contient des secrets)
+###############################################################
+
+aws_region   = "us-east-1"
+project_name = "anoors-portfolio"
+environment  = "dev"
+
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+availability_zone  = "us-east-1a"
+
+instance_type    = "t2.micro"
+key_pair_name    = "portfolio-keypair"
+ami_id           = "ami-0c7217cdde317cfec"
+root_volume_size = 20
+
+dockerhub_username = "anoor9s6"
+backend_image_tag  = "latest"
+frontend_image_tag = "latest"
+
+mongo_root_username = "admin"
+mongo_root_password = "CHANGE_ME"
+
+allowed_ssh_cidr  = "0.0.0.0/0"
+app_port_frontend = 80
+app_port_backend  = 5000
